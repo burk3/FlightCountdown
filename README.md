@@ -48,5 +48,6 @@ The build number is in `World of Warcraft\.build.info` (the `wowf` line).
 Push a tag like `v1.0.1`. The GitHub Action packages the addon with the
 [BigWigs packager](https://github.com/BigWigsMods/packager) and publishes a
 GitHub release (zip + `release.json`) and uploads the same zip to
-CurseForge (project 1801982, using the `CF_API_TOKEN` repo secret). Pushes to
+CurseForge (project 1801982, `CF_API_TOKEN` secret) and Wago (project
+qGZAkvKd, `WAGO_API_TOKEN` secret). Pushes to
 `main` build a zip as a workflow artifact without releasing.
