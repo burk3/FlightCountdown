@@ -10,6 +10,24 @@ flight time while you're on a flight path.
 - Hovering a destination on the flight map shows its flight time in the tooltip.
 - Survives `/reload` mid-flight. Landing early doesn't save a wrong time.
 
+## Screenshots
+
+**Flight time on the flight map.** Hover a destination to see how long the trip takes.
+
+![Flight map tooltip showing an estimated flight time](media/screenshots/tooltip.png)
+
+**Estimate in flight.** A route you haven't flown yet shows an amber bar with `~`.
+
+![In-flight countdown bar with an estimated time](media/screenshots/estimate.png)
+
+**Learning the real time.** When you land, the measured time is saved and compared with the estimate.
+
+![Chat message: Learned Orgrimmar -> Freewind Post: 4:55 (estimate was 4:53)](media/screenshots/estimate-to-recorded.png)
+
+**Exact time in flight.** Once a route has been flown, it shows a blue bar with the exact time.
+
+![In-flight countdown bar with an exact recorded time](media/screenshots/recorded.png)
+
 ## Install
 
 With [CurseBreaker](https://github.com/AcidWeb/CurseBreaker):
