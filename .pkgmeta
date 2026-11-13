@@ -4,3 +4,4 @@ ignore:
   - README.md
   - .luacheckrc
   - tools
+  - media
