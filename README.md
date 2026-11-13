@@ -61,6 +61,12 @@ changes its flight paths:
 
 The build number is in `World of Warcraft\.build.info` (the `wowf` line).
 
+Players don't lose their recorded times when the data is regenerated. Each
+recorded time stores the route length it was flown at, and is only ignored
+(and re-learned on the next flight) if that route's length changed by more than
+2%. Changes to the addon's own saved-data format are handled by a schema
+version and one-time migrations in `FlightCountdown.lua`.
+
 ## Releasing
 
 Push a tag like `v1.0.1`. The GitHub Action packages the addon with the

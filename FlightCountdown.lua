@@ -18,6 +18,12 @@ local DEFAULT_SPEED = 30.4      -- yards/second without Frequent Flier
 local DEFAULT_MAP_FACTOR = 600  -- seconds per flight-map width, rough fallback
 local PENDING_TIMEOUT = 30      -- seconds to wait for takeoff after choosing a node
 local RESUME_TIMEOUT = 15       -- seconds to wait for UnitOnTaxi after a reload
+local YARDS_TOLERANCE = 0.02    -- route length change that invalidates a recorded time
+
+-- Bump when the meaning or shape of saved data changes, and add a step to
+-- Migrate() that converts only what changed. Never bump for new RouteData;
+-- recorded times carry their route length and are checked against it.
+local SCHEMA_VERSION = 2
 
 -- Frequent Flier (Adventure Legacy tree): flight path mounts fly 20% faster.
 local FREQUENT_FLIER_TREE = 1188
@@ -82,12 +88,54 @@ end
 local function Speed() return DB.speed or DEFAULT_SPEED end
 local function MapFactor(cont) return DB.factors[cont] or DEFAULT_MAP_FACTOR end
 
--- Moves `old` part of the way toward `sample`, ignoring wild samples.
-local function Blend(old, sample, weight, lo, hi)
-    if not old then return sample end
+-- Moves `old` part of the way toward `sample`. A sample outside [lo, hi] times
+-- `old` is ignored as bad data, unless that keeps happening: after 3 misses in
+-- a row the stored value is assumed to be the wrong one and is replaced.
+local MAX_MISSES = 3
+local function Blend(old, sample, weight, lo, hi, missKey)
+    if not old then
+        DB.misses[missKey] = nil
+        return sample
+    end
     local ratio = sample / old
-    if ratio < lo or ratio > hi then return old end
+    if ratio < lo or ratio > hi then
+        local misses = (DB.misses[missKey] or 0) + 1
+        if misses >= MAX_MISSES then
+            DB.misses[missKey] = nil
+            return sample
+        end
+        DB.misses[missKey] = misses
+        return old
+    end
+    DB.misses[missKey] = nil
     return old + (sample - old) * weight
+end
+
+-- A recorded time in base seconds, or nil if there is none or if the route's
+-- length has changed since it was recorded (the game's flight path moved).
+-- Times recorded without a length are trusted; they gain one when re-flown.
+local function LearnedTime(key, yards)
+    local t = DB.times[key]
+    if not t then return nil end
+    if t.yards and yards and math.abs(yards - t.yards) > t.yards * YARDS_TOLERANCE then
+        return nil
+    end
+    return t.sec
+end
+
+local function Migrate()
+    local version = DB.version or 1
+    if version < 2 then
+        -- v1 times were plain numbers; v2 stores { sec, yards }.
+        for key, t in pairs(DB.times) do
+            if type(t) == "number" then DB.times[key] = { sec = t } end
+        end
+        -- The first release measured map distance in other units, so its
+        -- fallback factors are meaningless now. Times and speed are kept.
+        wipe(DB.factors)
+        DB.active = nil  -- moved to per-character storage
+    end
+    if version < SCHEMA_VERSION then DB.version = SCHEMA_VERSION end
 end
 
 ----------------------------------------------------------------------------
@@ -150,7 +198,7 @@ local function BuildRoute(index)
         local yards = idA and idB and routeYards[idA * 10000 + idB]
         if yards then route.yards = route.yards + yards else allYards = false end
 
-        local leg = aName and bName and DB.times[RouteKey(aName, bName)]
+        local leg = aName and bName and LearnedTime(RouteKey(aName, bName), yards)
         if leg then
             base = base + leg
         elseif yards then
@@ -163,7 +211,7 @@ local function BuildRoute(index)
     end
     if not allYards then route.yards = nil end
 
-    local exact = DB.times[RouteKey(src, dst)]
+    local exact = LearnedTime(RouteKey(src, dst), route.yards)
     if exact then
         route.base, route.kind = exact, "exact"
     else
@@ -314,23 +362,34 @@ local function Learn(f, duration)
     if not f.record or f.early or not f.src or not f.dst or duration < 5 then return end
     local base = duration * (f.mult or 1)
 
-    -- A wildly different time from a good estimate is probably bad data.
-    if f.kind ~= "rough" and f.base and f.base > 0 then
+    -- Speed and map factors run their own sanity checks (see Blend), so they
+    -- learn first: if flight speed ever really changes, they adapt, and the
+    -- length-based estimates below start agreeing with real times again.
+    if f.yards and f.yards > 0 then
+        DB.speed = Blend(DB.speed or DEFAULT_SPEED, f.yards / base, 0.25, 0.75, 1.33, "speed")
+    end
+    if f.raw and f.raw > 0 and f.cont then
+        DB.factors[f.cont] = Blend(DB.factors[f.cont], base / f.raw, 0.3, 0.5, 2, f.cont)
+    end
+
+    -- A time far from a length-based estimate is probably a bad flight.
+    if (f.kind == "yards" or f.kind == "legs") and f.base and f.base > 0 then
         local ratio = base / f.base
         if ratio < 0.6 or ratio > 1.6 then return end
     end
 
+    -- An existing time for the same route length is only replaced by a close
+    -- one, or by two disagreeing flights in a row.
     local key = RouteKey(f.src, f.dst)
-    local old = DB.times[key]
-    if old and (base / old < 0.75 or base / old > 1.33) then return end
-    DB.times[key] = math.floor(base + 0.5)
-
-    if f.yards and f.yards > 0 then
-        DB.speed = Blend(DB.speed or DEFAULT_SPEED, f.yards / base, 0.25, 0.75, 1.33)
+    local old = LearnedTime(key, f.yards) and DB.times[key]
+    if old then
+        local ratio = base / old.sec
+        if ratio < 0.75 or ratio > 1.33 then
+            old.misses = (old.misses or 0) + 1
+            if old.misses < 2 then return end
+        end
     end
-    if f.raw and f.raw > 0 and f.cont then
-        DB.factors[f.cont] = Blend(DB.factors[f.cont], base / f.raw, 0.3, 0.5, 2)
-    end
+    DB.times[key] = { sec = math.floor(base + 0.5), yards = f.yards or (old and old.yards) }
 
     if not old then
         local note = ""
@@ -484,9 +543,10 @@ events:SetScript("OnEvent", function(_, event, arg1)
             DB, CharDB = FlightCountdownDB, FlightCountdownCharDB
             DB.times = DB.times or {}
             DB.factors = DB.factors or {}
+            DB.misses = DB.misses or {}
             if DB.locked == nil then DB.locked = true end
             if DB.tooltip == nil then DB.tooltip = true end
-            DB.active = nil  -- moved to per-character storage
+            Migrate()
             RestorePosition()
             SetLocked(DB.locked)
         end
@@ -546,6 +606,7 @@ SlashCmdList.FLIGHTCOUNTDOWN = function(msg)
         DB.tooltip = not DB.tooltip
         Print("Flight map tooltip " .. (DB.tooltip and "on." or "off."))
     elseif msg == "forget" then
+        wipe(DB.misses)
         wipe(DB.times)
         wipe(DB.factors)
         DB.speed = nil
