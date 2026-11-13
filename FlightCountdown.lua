@@ -341,6 +341,9 @@ local function SaveActive()
     if flight and not flight.test then
         local a = {}
         for _, k in ipairs(SAVED_FIELDS) do a[k] = flight[k] end
+        -- GetTime() keeps running across /reload, so it restores the start
+        -- exactly; time() is whole seconds and only a fallback.
+        a.startTime = flight.start
         a.startEpoch = time() - (GetTime() - flight.start)
         CharDB.active = a
     else
@@ -562,6 +565,8 @@ events:SetScript("OnEvent", function(_, event, arg1)
             if isInitialLogin then
                 -- Offline time would make the countdown wrong; just count up.
                 resume.est, resume.record, resume.start = nil, false, GetTime()
+            elseif a.startTime and a.startTime <= GetTime() then
+                resume.start = a.startTime
             else
                 resume.start = GetTime() - (time() - (a.startEpoch or time()))
             end
