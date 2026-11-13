@@ -1,0 +1,39 @@
+name: Build
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    env:
+      GITHUB_OAUTH: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Lint
+        uses: lunarmodules/luacheck@v1
+
+      # Tags (v*) build and publish a GitHub release with release.json,
+      # which CurseBreaker uses to pick the Forever package.
+      # Everything else just builds the zip (-d skips uploading).
+      - name: Package
+        uses: BigWigsMods/packager@v2
+        with:
+          args: ${{ !startsWith(github.ref, 'refs/tags/') && '-d' || '' }}
+
+      - name: Upload build artifact
+        if: ${{ !startsWith(github.ref, 'refs/tags/') }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: FlightCountdown
+          path: .release/*.zip

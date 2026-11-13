@@ -1,0 +1,9 @@
+## Interface: 16001
+## Title: Flight Countdown
+## Notes: Shows a countdown of your remaining flight time while on a flight path. Learns exact times as you fly. /fc for options.
+## Author: burk3
+## Version: @project-version@
+## X-Website: https://github.com/burk3/FlightCountdown
+## SavedVariables: FlightCountdownDB
+
+FlightCountdown.lua
