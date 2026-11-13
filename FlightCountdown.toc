@@ -4,6 +4,8 @@
 ## Author: burk3
 ## Version: @project-version@
 ## X-Website: https://github.com/burk3/FlightCountdown
+## X-Curse-Project-ID: 1801982
+## X-License: MIT
 ## SavedVariables: FlightCountdownDB
 ## SavedVariablesPerCharacter: FlightCountdownCharDB
 
