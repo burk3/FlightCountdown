@@ -1,19 +1,38 @@
 -- Flight Countdown
--- Shows remaining flight time while on a taxi. Exact times are learned per
--- route the first time you fly it; unknown routes are estimated from the
--- route's distance on the flight map (and that estimate self-calibrates).
+-- Shows remaining flight time while on a taxi.
+--
+-- Where times come from, best first:
+--   1. A time you've measured for this exact route (learned on landing).
+--   2. Per hop: a measured time for that hop, else its flown length in yards
+--      (RouteData.lua, generated from the game's own flight path tables)
+--      divided by a flight speed that is learned as you fly.
+--   3. Per hop, if neither is known: straight-line distance on the flight map
+--      times a per-continent factor (also learned).
+-- Learned times and speeds are stored without the Frequent Flier perk's speed
+-- bonus, so they're shared correctly between characters with and without it.
 
-local ADDON_NAME = ...
+local ADDON_NAME, ns = ...
 local PREFIX = "|cff33ccffFlight Countdown|r: "
 
-local DB
-local DEFAULT_FACTOR = 1.4   -- seconds per flight-map UI unit, refined as you fly
-local PENDING_TIMEOUT = 30   -- seconds to wait after clicking a node for takeoff
+local DEFAULT_SPEED = 30.4      -- yards/second without Frequent Flier
+local DEFAULT_MAP_FACTOR = 600  -- seconds per flight-map width, rough fallback
+local PENDING_TIMEOUT = 30      -- seconds to wait for takeoff after choosing a node
+local RESUME_TIMEOUT = 15       -- seconds to wait for UnitOnTaxi after a reload
 
-local flight      -- the flight currently being shown
-local pending     -- route chosen on the flight map, waiting for takeoff
-local resume      -- in-flight state saved across a /reload or relog
-local hookedTooltip = false
+-- Frequent Flier (Adventure Legacy tree): flight path mounts fly 20% faster.
+local FREQUENT_FLIER_TREE = 1188
+local FREQUENT_FLIER_NODE = 110300
+local FREQUENT_FLIER_MULT = 1.2
+
+local routeYards = ns.routeYards or {}
+
+local DB       -- account-wide: learned times, speed, settings
+local CharDB   -- per character: the flight in progress
+local ready = false
+
+local flight   -- the flight being shown
+local pending  -- route chosen on the flight map, waiting for takeoff
+local resume   -- flight restored after /reload or relog, waiting for UnitOnTaxi
 
 ----------------------------------------------------------------------------
 -- Helpers
@@ -51,8 +70,24 @@ local function ContinentID()
     return id or 0
 end
 
-local function Factor(cont)
-    return (DB.factors[cont]) or DEFAULT_FACTOR
+local function SpeedMultiplier()
+    if not (C_Traits and C_Traits.GetConfigIDByTreeID and C_Traits.GetNodeInfo) then return 1 end
+    local ok, configID = pcall(C_Traits.GetConfigIDByTreeID, FREQUENT_FLIER_TREE)
+    if not ok or not configID then return 1 end
+    local ok2, info = pcall(C_Traits.GetNodeInfo, configID, FREQUENT_FLIER_NODE)
+    if ok2 and info and (info.activeRank or 0) > 0 then return FREQUENT_FLIER_MULT end
+    return 1
+end
+
+local function Speed() return DB.speed or DEFAULT_SPEED end
+local function MapFactor(cont) return DB.factors[cont] or DEFAULT_MAP_FACTOR end
+
+-- Moves `old` part of the way toward `sample`, ignoring wild samples.
+local function Blend(old, sample, weight, lo, hi)
+    if not old then return sample end
+    local ratio = sample / old
+    if ratio < lo or ratio > hi then return old end
+    return old + (sample - old) * weight
 end
 
 ----------------------------------------------------------------------------
@@ -65,63 +100,77 @@ local function CurrentNodeName()
     end
 end
 
-local function MapSize()
-    local m = TaxiRouteMap or TaxiFrame
-    local w, h = 1, 1
-    if m and m.GetWidth then w, h = m:GetWidth(), m:GetHeight() end
-    if not w or w <= 0 then w = 1 end
-    if not h or h <= 0 then h = 1 end
-    return w, h
+local function NodeIDsBySlot()
+    local ids = {}
+    local mapID = GetTaxiMapID and GetTaxiMapID()
+    if mapID and C_TaxiMap and C_TaxiMap.GetAllTaxiNodes then
+        local ok, nodes = pcall(C_TaxiMap.GetAllTaxiNodes, mapID)
+        if ok and nodes then
+            for _, node in ipairs(nodes) do
+                if node.slotIndex and node.nodeID then ids[node.slotIndex] = node.nodeID end
+            end
+        end
+    end
+    return ids
 end
 
--- Returns a table describing the route to taxi node `index`, or nil.
+-- Describes the route to taxi slot `index`, or returns nil.
+-- All times here are "base" times (no Frequent Flier); est is the real one.
 local function BuildRoute(index)
     if not index or TaxiNodeGetType(index) ~= "REACHABLE" then return nil end
     local src, dst = CurrentNodeName(), TaxiNodeName(index)
     if not src or not dst then return nil end
 
-    local route = { src = src, dst = dst, cont = ContinentID(), raw = 0 }
-    local exact = DB.times[RouteKey(src, dst)]
-
     local hops = GetNumRoutes(index) or 0
-    local w, h = MapSize()
-    local factor = Factor(route.cont)
-    local prev, sum, allKnown = src, 0, true
+    if hops < 1 then return nil end
+
+    local route = {
+        src = src, dst = dst, cont = ContinentID(), mult = SpeedMultiplier(),
+        hops = hops, raw = 0, yards = 0,
+    }
+    local ids = NodeIDsBySlot()
+    local speed, factor = Speed(), MapFactor(route.cont)
+    local base, allYards, allLegs, rough = 0, true, true, false
 
     for hop = 1, hops do
-        local sx, sy = TaxiGetSrcX(index, hop), TaxiGetSrcY(index, hop)
-        local dx, dy = TaxiGetDestX(index, hop), TaxiGetDestY(index, hop)
-        local d = 0
-        if sx and sy and dx and dy then
-            d = math.sqrt(((dx - sx) * w) ^ 2 + ((dy - sy) * h) ^ 2)
-        end
-        route.raw = route.raw + d
+        local a = TaxiGetNodeSlot(index, hop, true)
+        local b = TaxiGetNodeSlot(index, hop, false)
+        local aName = hop == 1 and src or (a and TaxiNodeName(a))
+        local bName = hop == hops and dst or (b and TaxiNodeName(b))
 
-        local nextName
-        if hop == hops then
-            nextName = dst
-        elseif TaxiGetNodeSlot then
-            local slot = TaxiGetNodeSlot(index, hop, false)
-            nextName = slot and TaxiNodeName(slot)
+        local raw = 0
+        if a and b then
+            local ax, ay = TaxiNodePosition(a)
+            local bx, by = TaxiNodePosition(b)
+            if ax and ay and bx and by then raw = math.sqrt((bx - ax) ^ 2 + (by - ay) ^ 2) end
         end
+        route.raw = route.raw + raw
 
-        local known = prev and nextName and DB.times[RouteKey(prev, nextName)]
-        if known then
-            sum = sum + known
+        local idA, idB = ids[a], ids[b]
+        local yards = idA and idB and routeYards[idA * 10000 + idB]
+        if yards then route.yards = route.yards + yards else allYards = false end
+
+        local leg = aName and bName and DB.times[RouteKey(aName, bName)]
+        if leg then
+            base = base + leg
+        elseif yards then
+            base = base + yards / speed
+            allLegs = false
         else
-            sum = sum + d * factor
-            allKnown = false
+            base = base + raw * factor
+            allLegs, rough = false, true
         end
-        prev = nextName
     end
+    if not allYards then route.yards = nil end
 
+    local exact = DB.times[RouteKey(src, dst)]
     if exact then
-        route.est, route.exact = exact, true
+        route.base, route.kind = exact, "exact"
     else
-        route.est, route.exact = sum, false
-        route.fromLegs = allKnown and hops > 1
+        route.base = base
+        route.kind = (allLegs and "legs") or (rough and "rough") or "yards"
     end
-    route.hops = hops
+    route.est = route.base / route.mult
     return route
 end
 
@@ -203,20 +252,24 @@ local function UpdateDisplay()
     local elapsed = GetTime() - flight.start
     title:SetText(ShortName(flight.dst))
 
-    if not flight.est or flight.est <= 0 then
+    if flight.early then
+        bar:SetStatusBarColor(0.5, 0.5, 0.5)
+        bar:SetValue(1)
+        timeText:SetText("Landing early...")
+    elseif not flight.est or flight.est <= 0 then
         bar:SetStatusBarColor(0.5, 0.5, 0.5)
         bar:SetValue(1)
         timeText:SetText("In flight  " .. FormatTime(elapsed))
     else
         local remaining = flight.est - elapsed
-        if flight.exact then
+        if flight.kind == "exact" then
             bar:SetStatusBarColor(0.2, 0.6, 1.0)
         else
             bar:SetStatusBarColor(1.0, 0.7, 0.1)
         end
         bar:SetValue(math.min(1, elapsed / flight.est))
         if remaining > 0 then
-            timeText:SetText((flight.exact and "" or "~") .. FormatTime(remaining))
+            timeText:SetText((flight.kind == "exact" and "" or "~") .. FormatTime(remaining))
         else
             timeText:SetText("Arriving...  +" .. FormatTime(-remaining))
         end
@@ -234,42 +287,52 @@ end
 -- Flight lifecycle
 ----------------------------------------------------------------------------
 
+local SAVED_FIELDS = { "src", "dst", "est", "base", "kind", "mult", "hops", "raw", "yards", "cont", "record", "early" }
+
 local function SaveActive()
     if flight and not flight.test then
-        DB.active = {
-            src = flight.src, dst = flight.dst, est = flight.est, exact = flight.exact,
-            raw = flight.raw, cont = flight.cont, record = flight.record,
-            startEpoch = time() - (GetTime() - flight.start),
-        }
+        local a = {}
+        for _, k in ipairs(SAVED_FIELDS) do a[k] = flight[k] end
+        a.startEpoch = time() - (GetTime() - flight.start)
+        CharDB.active = a
     else
-        DB.active = nil
+        CharDB.active = nil
     end
 end
 
 local function StartFlight(route)
-    flight = {
-        src = route.src, dst = route.dst, est = route.est, exact = route.exact,
-        raw = route.raw, cont = route.cont, test = route.test,
-        record = route.record ~= false and route.src ~= nil,
-        start = route.start or GetTime(),
-    }
+    flight = {}
+    for _, k in ipairs(SAVED_FIELDS) do flight[k] = route[k] end
+    flight.test = route.test
+    flight.record = route.record ~= false and route.src ~= nil and not route.test
+    flight.start = route.start or GetTime()
     SaveActive()
     UpdateDisplay()
 end
 
 local function Learn(f, duration)
-    if not f.record or not f.src or not f.dst or duration < 5 then return end
-    local key = RouteKey(f.src, f.dst)
-    local isNew = DB.times[key] == nil
-    DB.times[key] = math.floor(duration + 0.5)
+    if not f.record or f.early or not f.src or not f.dst or duration < 5 then return end
+    local base = duration * (f.mult or 1)
 
-    if f.raw and f.raw > 0 and f.cont then
-        local sample = duration / f.raw
-        local old = DB.factors[f.cont]
-        DB.factors[f.cont] = old and (old * 0.7 + sample * 0.3) or sample
+    -- A wildly different time from a good estimate is probably bad data.
+    if f.kind ~= "rough" and f.base and f.base > 0 then
+        local ratio = base / f.base
+        if ratio < 0.6 or ratio > 1.6 then return end
     end
 
-    if isNew then
+    local key = RouteKey(f.src, f.dst)
+    local old = DB.times[key]
+    if old and (base / old < 0.75 or base / old > 1.33) then return end
+    DB.times[key] = math.floor(base + 0.5)
+
+    if f.yards and f.yards > 0 then
+        DB.speed = Blend(DB.speed or DEFAULT_SPEED, f.yards / base, 0.25, 0.75, 1.33)
+    end
+    if f.raw and f.raw > 0 and f.cont then
+        DB.factors[f.cont] = Blend(DB.factors[f.cont], base / f.raw, 0.3, 0.5, 2)
+    end
+
+    if not old then
         local note = ""
         if f.est and f.est > 0 then
             note = string.format(" (estimate was %s)", FormatTime(f.est))
@@ -285,7 +348,7 @@ local function EndFlight()
         Learn(flight, GetTime() - flight.start)
     end
     flight = nil
-    DB.active = nil
+    CharDB.active = nil
     UpdateDisplay()
 end
 
@@ -298,28 +361,73 @@ hooksecurefunc("TakeTaxiNode", function(index)
     end
 end)
 
+-- Landing early cuts the flight short; never learn from it.
+if type(TaxiRequestEarlyLanding) == "function" then
+    hooksecurefunc("TaxiRequestEarlyLanding", function()
+        if flight and not flight.test then
+            flight.early, flight.record = true, false
+            SaveActive()
+            UpdateDisplay()
+        end
+    end)
+end
+
 ----------------------------------------------------------------------------
--- Flight map tooltip: show the time when hovering a destination
+-- Flight map tooltips: show the time when hovering a destination
 ----------------------------------------------------------------------------
 
-local function HookTooltip()
-    if hookedTooltip or type(TaxiNodeOnButtonEnter) ~= "function" then return end
-    hookedTooltip = true
-    hooksecurefunc("TaxiNodeOnButtonEnter", function(button)
-        if not DB.tooltip then return end
-        local ok, route = pcall(BuildRoute, button and button:GetID())
-        if not ok or not route or not route.est or route.est <= 0 then return end
-        local label
-        if route.exact then
-            label = "|cff33ccff" .. FormatTime(route.est) .. "|r"
-        elseif route.fromLegs then
-            label = "|cffffcc33~" .. FormatTime(route.est) .. "|r |cff888888(from known legs)|r"
-        else
-            label = "|cffffcc33~" .. FormatTime(route.est) .. "|r |cff888888(estimate)|r"
+local lastTipOwner, lastTipTime
+
+local function AddTooltipLine(owner, slot)
+    if not DB or not DB.tooltip then return end
+    local now = GetTime()
+    if lastTipOwner == owner and lastTipTime == now then return end  -- hooked twice
+    lastTipOwner, lastTipTime = owner, now
+
+    local ok, route = pcall(BuildRoute, slot)
+    if not ok or not route or not route.est or route.est <= 0 then return end
+    local label
+    if route.kind == "exact" then
+        label = "|cff33ccff" .. FormatTime(route.est) .. "|r"
+    elseif route.kind == "rough" then
+        label = "|cffffcc33~" .. FormatTime(route.est) .. "|r |cff888888(rough estimate)|r"
+    else
+        label = "|cffffcc33~" .. FormatTime(route.est) .. "|r |cff888888(estimate)|r"
+    end
+    GameTooltip:AddLine("Flight time: " .. label, 1, 1, 1)
+    GameTooltip:Show()
+end
+
+local function OnPinEnter(pin)
+    local data = pin and pin.taxiNodeData
+    if data and data.slotIndex then AddTooltipLine(pin, data.slotIndex) end
+end
+
+local hookedClassic, hookedMixin = false, false
+
+local function HookTooltips()
+    -- Classic-style TaxiFrame.
+    if not hookedClassic and type(TaxiNodeOnButtonEnter) == "function" then
+        hookedClassic = true
+        hooksecurefunc("TaxiNodeOnButtonEnter", function(button)
+            if button then AddTooltipLine(button, button:GetID()) end
+        end)
+    end
+    -- Retail-style FlightMapFrame (Blizzard_FlightMap, load on demand).
+    -- Hooking the mixin covers pins created from now on...
+    if not hookedMixin and FlightMap_FlightPointPinMixin then
+        hookedMixin = true
+        hooksecurefunc(FlightMap_FlightPointPinMixin, "OnMouseEnter", OnPinEnter)
+    end
+    -- ...and this covers pins that already existed.
+    if FlightMapFrame and FlightMapFrame.EnumeratePinsByTemplate then
+        for pin in FlightMapFrame:EnumeratePinsByTemplate("FlightMap_FlightPointPinTemplate") do
+            if not pin.flightCountdownHooked then
+                pin.flightCountdownHooked = true
+                hooksecurefunc(pin, "OnMouseEnter", OnPinEnter)
+            end
         end
-        GameTooltip:AddLine("Flight time: " .. label, 1, 1, 1)
-        GameTooltip:Show()
-    end)
+    end
 end
 
 ----------------------------------------------------------------------------
@@ -327,13 +435,12 @@ end
 ----------------------------------------------------------------------------
 
 local accum = 0
-
 local ticker = CreateFrame("Frame")
 ticker:SetScript("OnUpdate", function(_, elapsed)
     accum = accum + elapsed
     if accum < 0.1 then return end
     accum = 0
-    if not DB then return end
+    if not ready then return end
 
     local now = GetTime()
     local onTaxi = UnitOnTaxi("player")
@@ -352,8 +459,8 @@ ticker:SetScript("OnUpdate", function(_, elapsed)
     end
 
     if pending and now - pending.t >= PENDING_TIMEOUT then pending = nil end
-    if resume and now - resume.seen > 15 then
-        resume, DB.active = nil, nil
+    if resume and now - resume.seen > RESUME_TIMEOUT then
+        resume, CharDB.active = nil, nil
     end
 
     if flight then
@@ -369,38 +476,45 @@ events:RegisterEvent("ADDON_LOADED")
 events:RegisterEvent("PLAYER_ENTERING_WORLD")
 events:RegisterEvent("TAXIMAP_OPENED")
 events:RegisterEvent("PLAYER_LOGOUT")
-events:SetScript("OnEvent", function(_, event, arg1, arg2)
-    if event == "ADDON_LOADED" and arg1 == ADDON_NAME then
-        FlightCountdownDB = FlightCountdownDB or {}
-        DB = FlightCountdownDB
-        DB.times = DB.times or {}
-        DB.factors = DB.factors or {}
-        if DB.locked == nil then DB.locked = true end
-        if DB.tooltip == nil then DB.tooltip = true end
-        RestorePosition()
-        SetLocked(DB.locked)
-        HookTooltip()
+events:SetScript("OnEvent", function(_, event, arg1)
+    if event == "ADDON_LOADED" then
+        if arg1 == ADDON_NAME then
+            FlightCountdownDB = FlightCountdownDB or {}
+            FlightCountdownCharDB = FlightCountdownCharDB or {}
+            DB, CharDB = FlightCountdownDB, FlightCountdownCharDB
+            DB.times = DB.times or {}
+            DB.factors = DB.factors or {}
+            if DB.locked == nil then DB.locked = true end
+            if DB.tooltip == nil then DB.tooltip = true end
+            DB.active = nil  -- moved to per-character storage
+            RestorePosition()
+            SetLocked(DB.locked)
+        end
+        if DB then HookTooltips() end
 
     elseif event == "PLAYER_ENTERING_WORLD" then
         local isInitialLogin = arg1
-        HookTooltip()
-        if DB and DB.active and not flight then
-            local a = DB.active
-            resume = {
-                src = a.src, dst = a.dst, est = a.est, exact = a.exact, raw = a.raw,
-                cont = a.cont,
-                -- After a full relog, time spent offline would skew the timing.
-                record = (a.record and not isInitialLogin) and true or false,
-                start = GetTime() - (time() - (a.startEpoch or time())),
-                seen = GetTime(),
-            }
+        HookTooltips()
+        local a = CharDB.active
+        if a and not flight then
+            resume = {}
+            for _, k in ipairs(SAVED_FIELDS) do resume[k] = a[k] end
+            if isInitialLogin then
+                -- Offline time would make the countdown wrong; just count up.
+                resume.est, resume.record, resume.start = nil, false, GetTime()
+            else
+                resume.start = GetTime() - (time() - (a.startEpoch or time()))
+            end
+            resume.seen = GetTime()
         end
+        ready = true
 
     elseif event == "TAXIMAP_OPENED" then
-        HookTooltip()
+        HookTooltips()
+        C_Timer.After(0, HookTooltips)  -- pins are created as the map shows
 
     elseif event == "PLAYER_LOGOUT" then
-        SaveActive()
+        if CharDB then SaveActive() end
     end
 end)
 
@@ -423,18 +537,24 @@ SlashCmdList.FLIGHTCOUNTDOWN = function(msg)
         RestorePosition()
         Print("Position reset.")
     elseif msg == "test" then
-        StartFlight({ dst = "Test Flight, Somewhere", est = 20, exact = true, test = true, record = false })
+        if flight and not flight.test then
+            Print("You're on a real flight right now.")
+        else
+            StartFlight({ dst = "Test Flight, Somewhere", est = 20, kind = "exact", test = true, record = false })
+        end
     elseif msg == "tooltip" then
         DB.tooltip = not DB.tooltip
         Print("Flight map tooltip " .. (DB.tooltip and "on." or "off."))
     elseif msg == "forget" then
         wipe(DB.times)
         wipe(DB.factors)
-        Print("Forgot all learned flight times.")
+        DB.speed = nil
+        Print("Forgot all learned flight times and speeds.")
     else
         local n = 0
         for _ in pairs(DB.times) do n = n + 1 end
-        Print(string.format("%d route(s) learned.", n))
+        Print(string.format("%d route(s) learned. Flight speed %.1f yd/s%s.", n, Speed(),
+            SpeedMultiplier() > 1 and " (+20% Frequent Flier)" or ""))
         Print("/fc unlock | lock | reset | test | tooltip | forget")
     end
 end
